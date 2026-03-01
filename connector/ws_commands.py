@@ -1,0 +1,378 @@
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import mimetypes
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Callable, Mapping
+
+import httpx
+
+from connector.config import ConnectorConfig
+from connector.outbox import OutboxDB
+
+ALLOWED_REQUEST_TYPES = frozenset(
+    {"ping", "device.info", "connector.stats", "camera.capture"}
+)
+REQUEST_CACHE_TTL_SECONDS = 300
+REQUEST_CACHE_MAX_ENTRIES = 256
+
+
+@dataclass(frozen=True)
+class RequestContext:
+    request_id: str
+    request_type: str
+    params: dict[str, Any]
+    accepted: bool
+    reason: str | None
+
+
+class CommandExecutionError(RuntimeError):
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+def _string_or_empty(value: Any) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    return ""
+
+
+def _build_image_fetch_url(camera_service_url: str, image_url_or_path: str) -> str:
+    if image_url_or_path.startswith(("http://", "https://")):
+        return image_url_or_path
+    if image_url_or_path.startswith("/"):
+        return f"{camera_service_url}{image_url_or_path}"
+    return f"{camera_service_url}/{image_url_or_path}"
+
+
+def _response_json_dict(response: httpx.Response) -> dict[str, Any] | None:
+    try:
+        payload = response.json()
+    except ValueError:
+        return None
+    if isinstance(payload, dict):
+        return payload
+    return None
+
+
+def _resolve_content_type(content_type_header: str | None, image_url_or_path: str) -> str:
+    if content_type_header:
+        normalized = content_type_header.split(";", 1)[0].strip()
+        if normalized:
+            return normalized
+    guessed, _ = mimetypes.guess_type(image_url_or_path)
+    if guessed:
+        return guessed
+    return "application/octet-stream"
+
+
+def _resolve_upload_filename(
+    image_id: str, image_url_or_path: str, content_type: str
+) -> str:
+    suffix = Path(image_url_or_path).suffix
+    if not suffix:
+        suffix = mimetypes.guess_extension(content_type) or ""
+    return f"{image_id}{suffix}"
+
+
+class WSCommandHandler:
+    def __init__(
+        self,
+        config: ConnectorConfig,
+        outbox_db: OutboxDB,
+        identity: dict[str, str],
+        *,
+        started_at: str,
+        get_forwarder_stats: Callable[[], dict[str, str | None]] | None = None,
+        http_transport: httpx.AsyncBaseTransport | None = None,
+    ) -> None:
+        self.config = config
+        self.outbox_db = outbox_db
+        self.identity = identity
+        self.started_at = started_at
+        self.get_forwarder_stats = get_forwarder_stats or (lambda: {})
+        self.http_transport = http_transport
+        self._command_lock = asyncio.Lock()
+
+    def build_ack_payload(self, payload: Mapping[str, Any]) -> tuple[dict[str, Any], RequestContext]:
+        request_id = _string_or_empty(payload.get("request_id"))
+        request_type = _string_or_empty(payload.get("request_type"))
+        params = payload.get("params")
+        params_dict = params if isinstance(params, dict) else {}
+        accepted = request_type in ALLOWED_REQUEST_TYPES
+        reason: str | None = None
+        if not accepted:
+            reason = "unknown_request_type"
+        elif not request_id:
+            reason = "missing_request_id"
+
+        ack_payload: dict[str, Any] = {
+            "request_id": request_id,
+            "request_type": request_type,
+            "accepted": accepted,
+        }
+        if reason is not None:
+            ack_payload["reason"] = reason
+
+        context = RequestContext(
+            request_id=request_id,
+            request_type=request_type,
+            params=params_dict,
+            accepted=accepted,
+            reason=reason,
+        )
+        return ack_payload, context
+
+    async def build_response_payload(self, context: RequestContext) -> dict[str, Any]:
+        if not context.request_id:
+            return self._error_response(
+                context,
+                code="invalid_request",
+                message="request_id is required.",
+            )
+
+        current_ts = int(time.time())
+        cached = await self.outbox_db.get_cached_ws_response(
+            context.request_id, current_ts
+        )
+        if cached is not None:
+            return cached
+
+        if not context.accepted:
+            response = self._rejected_response(context)
+            await self._cache_response(context.request_id, response, current_ts=current_ts)
+            return response
+
+        async with self._command_lock:
+            current_ts = int(time.time())
+            cached = await self.outbox_db.get_cached_ws_response(
+                context.request_id, current_ts
+            )
+            if cached is not None:
+                return cached
+
+            response = await self._execute_with_timeout(context)
+            await self._cache_response(context.request_id, response, current_ts=current_ts)
+            return response
+
+    async def handle_request_payload(
+        self, payload: Mapping[str, Any]
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        ack_payload, context = self.build_ack_payload(payload)
+        response_payload = await self.build_response_payload(context)
+        return ack_payload, response_payload
+
+    async def _cache_response(
+        self, request_id: str, response_payload: dict[str, Any], *, current_ts: int
+    ) -> None:
+        await self.outbox_db.put_cached_ws_response(
+            request_id=request_id,
+            response_payload=response_payload,
+            created_at_ts=current_ts,
+            expires_at_ts=current_ts + REQUEST_CACHE_TTL_SECONDS,
+            max_entries=REQUEST_CACHE_MAX_ENTRIES,
+        )
+
+    async def _execute_with_timeout(self, context: RequestContext) -> dict[str, Any]:
+        try:
+            data = await asyncio.wait_for(
+                self._execute_request(context.request_type, context.params),
+                timeout=self.config.command_timeout_seconds,
+            )
+            return {
+                "request_id": context.request_id,
+                "request_type": context.request_type,
+                "status": "ok",
+                "data": data,
+            }
+        except asyncio.TimeoutError:
+            return self._error_response(
+                context,
+                code="command_timeout",
+                message=(
+                    f"Command timed out after {self.config.command_timeout_seconds} seconds."
+                ),
+            )
+        except CommandExecutionError as exc:
+            return self._error_response(context, code=exc.code, message=exc.message)
+        except Exception as exc:  # pragma: no cover - defensive fallback
+            return self._error_response(
+                context,
+                code="internal_error",
+                message=str(exc),
+            )
+
+    async def _execute_request(self, request_type: str, params: dict[str, Any]) -> dict[str, Any]:
+        if request_type == "ping":
+            return {"pong": True}
+        if request_type == "device.info":
+            return {
+                "device_id": self.identity["device_id"],
+                "connector_version": self.config.connector_version,
+                "hostname": self.config.hostname,
+                "os": self.config.os_name,
+                "started_at": self.started_at,
+            }
+        if request_type == "connector.stats":
+            return await self._connector_stats()
+        if request_type == "camera.capture":
+            return await self._camera_capture(params)
+        raise CommandExecutionError(
+            "rejected_not_allowed",
+            "Request type is not allowlisted.",
+        )
+
+    async def _connector_stats(self) -> dict[str, Any]:
+        counts = await self.outbox_db.get_status_counts()
+        runtime_stats = self.get_forwarder_stats()
+        last_error = runtime_stats.get("last_forward_error")
+        if not isinstance(last_error, str) or not last_error.strip():
+            last_error = await self.outbox_db.get_last_error()
+        if isinstance(last_error, str):
+            last_error = last_error[:240]
+        else:
+            last_error = None
+
+        last_success = runtime_stats.get("last_forward_success_at")
+        if not isinstance(last_success, str) or not last_success.strip():
+            last_success = None
+
+        return {
+            "queued": int(counts.get("queued", 0)),
+            "sending": int(counts.get("sending", 0)),
+            "sent": int(counts.get("sent", 0)),
+            "dead": int(counts.get("dead", 0)),
+            "last_forward_error": last_error,
+            "last_forward_success_at": last_success,
+        }
+
+    async def _camera_capture(self, params: dict[str, Any]) -> dict[str, Any]:
+        capture_payload = {
+            key: params[key]
+            for key in ("resolution", "format", "quality")
+            if key in params and params[key] is not None
+        }
+
+        client_kwargs: dict[str, Any] = {}
+        if self.http_transport is not None:
+            client_kwargs["transport"] = self.http_transport
+
+        async with httpx.AsyncClient(**client_kwargs) as client:
+            capture_kwargs: dict[str, Any] = {}
+            if capture_payload:
+                capture_kwargs["json"] = capture_payload
+            capture_url = f"{self.config.camera_service_url}/capture"
+            capture_response = await client.post(capture_url, **capture_kwargs)
+            if capture_response.status_code >= 400:
+                raise CommandExecutionError(
+                    "camera_unavailable",
+                    f"Camera service capture failed with HTTP {capture_response.status_code}.",
+                )
+            capture_data = _response_json_dict(capture_response)
+            if capture_data is None:
+                raise CommandExecutionError(
+                    "camera_unavailable",
+                    "Camera service returned invalid capture JSON.",
+                )
+
+            image_id = _string_or_empty(capture_data.get("image_id"))
+            image_url_or_path = _string_or_empty(capture_data.get("image_url_or_path"))
+            if not image_url_or_path:
+                image_url_or_path = _string_or_empty(capture_data.get("image_url"))
+            if not image_url_or_path:
+                image_url_or_path = _string_or_empty(capture_data.get("image_path"))
+            if not image_id or not image_url_or_path:
+                raise CommandExecutionError(
+                    "camera_unavailable",
+                    "Camera service response missing image_id or image URL/path.",
+                )
+
+            fetch_url = _build_image_fetch_url(
+                self.config.camera_service_url, image_url_or_path
+            )
+            image_response = await client.get(fetch_url)
+            if image_response.status_code >= 400:
+                raise CommandExecutionError(
+                    "camera_fetch_failed",
+                    f"Failed to fetch camera image with HTTP {image_response.status_code}.",
+                )
+            image_bytes = image_response.content
+            if not image_bytes:
+                raise CommandExecutionError(
+                    "camera_fetch_failed",
+                    "Camera image fetch returned empty content.",
+                )
+
+            content_type = _resolve_content_type(
+                image_response.headers.get("content-type"),
+                image_url_or_path,
+            )
+            sha256 = hashlib.sha256(image_bytes).hexdigest()
+            size_bytes = len(image_bytes)
+
+            upload_url = f"{self.identity['online_url']}{self.config.oms_blob_upload_path}"
+            upload_filename = _resolve_upload_filename(
+                image_id, image_url_or_path, content_type
+            )
+            upload_response = await client.post(
+                upload_url,
+                headers={"Authorization": f"Bearer {self.identity['device_token']}"},
+                data={
+                    "image_id": image_id,
+                    "content_type": content_type,
+                    "sha256": sha256,
+                },
+                files={
+                    "file": (upload_filename, image_bytes, content_type),
+                },
+            )
+            if upload_response.status_code >= 400:
+                raise CommandExecutionError(
+                    "blob_upload_failed",
+                    f"OMS blob upload failed with HTTP {upload_response.status_code}.",
+                )
+            upload_data = _response_json_dict(upload_response)
+            blob_id = _string_or_empty(upload_data.get("blob_id") if upload_data else None)
+            if not blob_id:
+                raise CommandExecutionError(
+                    "blob_upload_failed",
+                    "OMS blob upload response missing blob_id.",
+                )
+
+            return {
+                "image_id": image_id,
+                "blob_id": blob_id,
+                "sha256": sha256,
+                "size_bytes": size_bytes,
+                "content_type": content_type,
+            }
+
+    def _rejected_response(self, context: RequestContext) -> dict[str, Any]:
+        return {
+            "request_id": context.request_id,
+            "request_type": context.request_type,
+            "status": "rejected",
+            "error": {
+                "code": "rejected_not_allowed",
+                "message": "Request type is not allowlisted.",
+            },
+        }
+
+    def _error_response(
+        self,
+        context: RequestContext,
+        *,
+        code: str,
+        message: str,
+    ) -> dict[str, Any]:
+        return {
+            "request_id": context.request_id,
+            "request_type": context.request_type,
+            "status": "error",
+            "error": {"code": code, "message": message},
+        }

@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=65.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "local-connector"
+version = "0.1.0"
+description = "Local connector registration client for OnlineMainServer"
+requires-python = ">=3.10"
+dependencies = [
+  "requests>=2.31.0",
+  "fastapi",
+  "uvicorn",
+  "pydantic-settings",
+  "httpx",
+  "aiosqlite",
+  "websockets"
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0.0",
+  "pytest-asyncio",
+  "httpx",
+  "websockets"
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
