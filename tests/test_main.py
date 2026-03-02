@@ -1,9 +1,8 @@
-import os
-from unittest.mock import patch
 import pytest
 
+from connector.config import ConnectorConfig, resolve_config
 from connector.main import perform_startup_registration
-from connector.config import ConnectorConfig
+
 
 def test_missing_identity_missing_env_vars(tmp_path):
     identity_path = tmp_path / "missing.json"
@@ -17,6 +16,19 @@ def test_missing_identity_missing_env_vars(tmp_path):
         perform_startup_registration(config)
     
     assert exc_info.value.code == 1
+
+
+def test_resolve_config_normalizes_online_paths(monkeypatch):
+    monkeypatch.setenv("ONLINE_UPDATE_PATH", "update")
+    monkeypatch.setenv("ONLINE_WS_PATH", "connector-ws")
+    monkeypatch.setenv("OMS_BLOB_UPLOAD_PATH", "connector-blobs")
+
+    config = resolve_config(online_url_override="https://online.test/")
+
+    assert config.online_url == "https://online.test"
+    assert config.online_update_path == "/update"
+    assert config.online_ws_path == "/connector-ws"
+    assert config.oms_blob_upload_path == "/connector-blobs"
 
 def test_missing_identity_invalid_url(tmp_path):
     identity_path = tmp_path / "missing.json"

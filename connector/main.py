@@ -4,7 +4,6 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 from fastapi import FastAPI
-from pydantic import ValidationError
 
 from connector.api import api_router
 from connector.config import ConnectorConfig, resolve_config
@@ -70,14 +69,18 @@ async def lifespan(app: FastAPI):
     )
     ws_task = asyncio.create_task(ws_worker.start())
     app.state.ws_worker = ws_worker
-    
-    yield
-    
-    # Shutdown
-    ws_worker.stop()
-    worker.stop()
-    await ws_task
-    await worker_task
+
+    try:
+        yield
+    finally:
+        # Shutdown
+        ws_worker.stop()
+        worker.stop()
+        try:
+            await ws_task
+            await worker_task
+        finally:
+            await outbox_db.close()
 
 
 def create_app(config: ConnectorConfig | None = None) -> FastAPI:

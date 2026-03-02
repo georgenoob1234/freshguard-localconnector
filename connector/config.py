@@ -66,6 +66,8 @@ def resolve_config(
         
     if config.online_url:
         config.online_url = config.online_url.rstrip("/")
+    if not config.online_update_path.startswith("/"):
+        config.online_update_path = f"/{config.online_update_path}"
     if not config.online_ws_path.startswith("/"):
         config.online_ws_path = f"/{config.online_ws_path}"
     if not config.oms_blob_upload_path.startswith("/"):

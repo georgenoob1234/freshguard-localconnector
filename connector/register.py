@@ -30,6 +30,15 @@ class RegistrationError(RuntimeError):
     """Raised when registration cannot complete."""
 
 
+def _require_online_url(config: ConnectorConfig) -> str:
+    online_url = (config.online_url or "").strip()
+    if not online_url:
+        raise RegistrationError("Missing ONLINE_URL. Set ONLINE_URL or pass --online-url.")
+    if not online_url.startswith(("http://", "https://")):
+        raise RegistrationError("ONLINE_URL must start with http:// or https://.")
+    return online_url.rstrip("/")
+
+
 def _require_enroll_token(config: ConnectorConfig, override: str | None = None) -> str:
     token = (override or config.enroll_token or "").strip()
     if not token:
@@ -71,8 +80,9 @@ def register_now(
     enroll_token_override: str | None = None,
     client: OnlineMainServerClient | None = None,
 ) -> dict[str, str]:
+    online_url = _require_online_url(config)
     enroll_token = _require_enroll_token(config, override=enroll_token_override)
-    registration_client = client or OnlineMainServerClient(config.online_url)
+    registration_client = client or OnlineMainServerClient(online_url)
     try:
         response_json = registration_client.register_connector(
             enroll_token,
@@ -89,7 +99,7 @@ def register_now(
             f"Registration failed: HTTP {exc.status_code}. Please try again."
         ) from exc
 
-    identity = _build_identity(config.online_url, response_json)
+    identity = _build_identity(online_url, response_json)
     write_identity_atomic(config.identity_path, identity)
     LOGGER.info("Connector registered successfully with device_id=%s", identity["device_id"])
     return identity

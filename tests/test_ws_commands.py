@@ -48,90 +48,116 @@ async def _build_handler(
 
 @pytest.mark.asyncio
 async def test_allowlist_unknown_request_type_rejected(tmp_path: Path) -> None:
-    handler, _ = await _build_handler(tmp_path)
+    handler, outbox_db = await _build_handler(tmp_path)
+    try:
+        ack_payload, response_payload = await handler.handle_request_payload(
+            {
+                "request_id": "req-unknown",
+                "request_type": "not.allowlisted",
+                "params": {},
+            }
+        )
 
-    ack_payload, response_payload = await handler.handle_request_payload(
-        {
-            "request_id": "req-unknown",
-            "request_type": "not.allowlisted",
-            "params": {},
-        }
-    )
+        assert ack_payload["accepted"] is False
+        assert ack_payload["reason"] == "unknown_request_type"
+        assert response_payload["status"] == "rejected"
+        assert response_payload["error"]["code"] == "rejected_not_allowed"
+    finally:
+        await outbox_db.close()
 
-    assert ack_payload["accepted"] is False
-    assert ack_payload["reason"] == "unknown_request_type"
-    assert response_payload["status"] == "rejected"
-    assert response_payload["error"]["code"] == "rejected_not_allowed"
+
+@pytest.mark.asyncio
+async def test_missing_request_id_is_not_accepted(tmp_path: Path) -> None:
+    handler, outbox_db = await _build_handler(tmp_path)
+    try:
+        ack_payload, response_payload = await handler.handle_request_payload(
+            {
+                "request_type": "ping",
+                "params": {},
+            }
+        )
+
+        assert ack_payload["accepted"] is False
+        assert ack_payload["reason"] == "missing_request_id"
+        assert response_payload["status"] == "error"
+        assert response_payload["error"]["code"] == "invalid_request"
+    finally:
+        await outbox_db.close()
 
 
 @pytest.mark.asyncio
 async def test_ping_request_returns_pong(tmp_path: Path) -> None:
-    handler, _ = await _build_handler(tmp_path)
+    handler, outbox_db = await _build_handler(tmp_path)
+    try:
+        ack_payload, response_payload = await handler.handle_request_payload(
+            {
+                "request_id": "req-ping",
+                "request_type": "ping",
+                "params": {},
+            }
+        )
 
-    ack_payload, response_payload = await handler.handle_request_payload(
-        {
-            "request_id": "req-ping",
-            "request_type": "ping",
-            "params": {},
-        }
-    )
-
-    assert ack_payload["accepted"] is True
-    assert response_payload["status"] == "ok"
-    assert response_payload["data"] == {"pong": True}
+        assert ack_payload["accepted"] is True
+        assert response_payload["status"] == "ok"
+        assert response_payload["data"] == {"pong": True}
+    finally:
+        await outbox_db.close()
 
 
 @pytest.mark.asyncio
 async def test_connector_stats_returns_integer_counts(tmp_path: Path) -> None:
     handler, outbox_db = await _build_handler(tmp_path)
-    now = int(time.time())
+    try:
+        now = int(time.time())
 
-    await outbox_db.insert(
-        "img-queued",
-        {"session_id": "s1", "image_id": "img-queued", "fruits": []},
-        now,
-    )
-    await outbox_db.insert(
-        "img-sending",
-        {"session_id": "s1", "image_id": "img-sending", "fruits": []},
-        now,
-    )
-    await outbox_db.mark_sending("img-sending")
-    await outbox_db.insert(
-        "img-sent",
-        {"session_id": "s1", "image_id": "img-sent", "fruits": []},
-        now,
-    )
-    await outbox_db.mark_sent("img-sent")
-    await outbox_db.insert(
-        "img-dead",
-        {"session_id": "s1", "image_id": "img-dead", "fruits": []},
-        now,
-    )
-    await outbox_db.mark_failed(
-        image_id="img-dead",
-        attempts=20,
-        next_retry_ts=now + 60,
-        error="dead-letter",
-        max_attempts=20,
-    )
+        await outbox_db.insert(
+            "img-queued",
+            {"session_id": "s1", "image_id": "img-queued", "fruits": []},
+            now,
+        )
+        await outbox_db.insert(
+            "img-sending",
+            {"session_id": "s1", "image_id": "img-sending", "fruits": []},
+            now,
+        )
+        await outbox_db.mark_sending("img-sending")
+        await outbox_db.insert(
+            "img-sent",
+            {"session_id": "s1", "image_id": "img-sent", "fruits": []},
+            now,
+        )
+        await outbox_db.mark_sent("img-sent")
+        await outbox_db.insert(
+            "img-dead",
+            {"session_id": "s1", "image_id": "img-dead", "fruits": []},
+            now,
+        )
+        await outbox_db.mark_failed(
+            image_id="img-dead",
+            attempts=20,
+            next_retry_ts=now + 60,
+            error="dead-letter",
+            max_attempts=20,
+        )
 
-    _, response_payload = await handler.handle_request_payload(
-        {
-            "request_id": "req-stats",
-            "request_type": "connector.stats",
-            "params": {},
-        }
-    )
+        _, response_payload = await handler.handle_request_payload(
+            {
+                "request_id": "req-stats",
+                "request_type": "connector.stats",
+                "params": {},
+            }
+        )
 
-    assert response_payload["status"] == "ok"
-    data = response_payload["data"]
-    for key in ("queued", "sending", "sent", "dead"):
-        assert isinstance(data[key], int)
-    assert data["queued"] == 1
-    assert data["sending"] == 1
-    assert data["sent"] == 1
-    assert data["dead"] == 1
+        assert response_payload["status"] == "ok"
+        data = response_payload["data"]
+        for key in ("queued", "sending", "sent", "dead"):
+            assert isinstance(data[key], int)
+        assert data["queued"] == 1
+        assert data["sending"] == 1
+        assert data["sent"] == 1
+        assert data["dead"] == 1
+    finally:
+        await outbox_db.close()
 
 
 @pytest.mark.asyncio
@@ -170,21 +196,23 @@ async def test_camera_capture_uploads_blob_and_returns_blob_id(tmp_path: Path) -
         raise AssertionError(f"Unexpected request {request.method} {request_url}")
 
     transport = httpx.MockTransport(handle_request)
-    handler, _ = await _build_handler(tmp_path, transport=transport)
+    handler, outbox_db = await _build_handler(tmp_path, transport=transport)
+    try:
+        ack_payload, response_payload = await handler.handle_request_payload(
+            {
+                "request_id": "req-camera",
+                "request_type": "camera.capture",
+                "params": {"resolution": "640x480"},
+            }
+        )
 
-    ack_payload, response_payload = await handler.handle_request_payload(
-        {
-            "request_id": "req-camera",
-            "request_type": "camera.capture",
-            "params": {"resolution": "640x480"},
-        }
-    )
-
-    assert ack_payload["accepted"] is True
-    assert response_payload["status"] == "ok"
-    data = response_payload["data"]
-    assert data["image_id"] == "img-cam-1"
-    assert data["blob_id"] == "blob-123"
-    assert data["content_type"] == "image/jpeg"
-    assert data["size_bytes"] == len(image_bytes)
-    assert all(not isinstance(value, (bytes, bytearray)) for value in data.values())
+        assert ack_payload["accepted"] is True
+        assert response_payload["status"] == "ok"
+        data = response_payload["data"]
+        assert data["image_id"] == "img-cam-1"
+        assert data["blob_id"] == "blob-123"
+        assert data["content_type"] == "image/jpeg"
+        assert data["size_bytes"] == len(image_bytes)
+        assert all(not isinstance(value, (bytes, bytearray)) for value in data.values())
+    finally:
+        await outbox_db.close()

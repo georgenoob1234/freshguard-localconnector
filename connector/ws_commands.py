@@ -109,6 +109,7 @@ class WSCommandHandler:
         if not accepted:
             reason = "unknown_request_type"
         elif not request_id:
+            accepted = False
             reason = "missing_request_id"
 
         ack_payload: dict[str, Any] = {
@@ -261,6 +262,10 @@ class WSCommandHandler:
         client_kwargs: dict[str, Any] = {}
         if self.http_transport is not None:
             client_kwargs["transport"] = self.http_transport
+        client_kwargs["timeout"] = max(
+            1.0,
+            float(self.config.command_timeout_seconds) / 2.0,
+        )
 
         async with httpx.AsyncClient(**client_kwargs) as client:
             capture_kwargs: dict[str, Any] = {}

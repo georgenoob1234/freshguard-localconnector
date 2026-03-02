@@ -51,6 +51,14 @@ def _config(tmp_path: Path, enroll_token: str | None = "enroll-123") -> Connecto
     )
 
 
+def test_register_now_requires_online_url(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    cfg.online_url = None
+
+    with pytest.raises(RegistrationError, match="Missing ONLINE_URL"):
+        register_now(cfg, enroll_token_override="token-from-cli")
+
+
 def test_corrupted_identity_is_renamed_then_registered(tmp_path: Path) -> None:
     cfg = _config(tmp_path)
     cfg.identity_path.write_text("{this-is-not-json", encoding="utf-8")

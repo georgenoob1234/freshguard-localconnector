@@ -64,3 +64,4 @@ async def test_forwarder_worker(tmp_path: Path):
     rows = await outbox_db.get_queued(current_ts=2_000_000_000)
     assert len(rows) == 0
     await client.aclose()
+    await outbox_db.close()

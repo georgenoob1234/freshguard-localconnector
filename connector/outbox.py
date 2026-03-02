@@ -37,21 +37,44 @@ class OutboxDB:
     def __init__(self, db_path: Path):
         self.db_path = db_path
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._db: aiosqlite.Connection | None = None
 
     async def init_db(self) -> None:
-        async with aiosqlite.connect(self.db_path) as db:
-            if not await self._outbox_exists(db):
-                await db.execute(CREATE_OUTBOX_TABLE_SQL)
-            else:
-                columns = await self._outbox_columns(db)
-                if "scan_id" in columns:
-                    await self._migrate_scan_id_to_image_id(db)
-                elif "image_id" not in columns:
-                    raise RuntimeError(
-                        "Unsupported outbox schema: expected image_id or scan_id column."
-                    )
-            await db.execute(CREATE_WS_REQUEST_CACHE_TABLE_SQL)
-            await db.commit()
+        if self._db is not None:
+            return
+
+        self._db = await aiosqlite.connect(self.db_path)
+        db = self._require_db()
+
+        if not await self._outbox_exists(db):
+            await db.execute(CREATE_OUTBOX_TABLE_SQL)
+        else:
+            columns = await self._outbox_columns(db)
+            if "scan_id" in columns:
+                await self._migrate_scan_id_to_image_id(db)
+            elif "image_id" not in columns:
+                raise RuntimeError(
+                    "Unsupported outbox schema: expected image_id or scan_id column."
+                )
+        await db.execute(CREATE_WS_REQUEST_CACHE_TABLE_SQL)
+        await db.commit()
+
+        recovered = await self.recover_stale_sending()
+        if recovered:
+            LOGGER.info(
+                "Recovered %d stale outbox rows from sending to queued.", recovered
+            )
+
+    async def close(self) -> None:
+        if self._db is None:
+            return
+        await self._db.close()
+        self._db = None
+
+    def _require_db(self) -> aiosqlite.Connection:
+        if self._db is None:
+            raise RuntimeError("OutboxDB is not initialized. Call init_db() first.")
+        return self._db
 
     async def _outbox_exists(self, db: aiosqlite.Connection) -> bool:
         async with db.execute(
@@ -98,49 +121,49 @@ class OutboxDB:
         """Returns True if inserted, False if duplicate"""
         try:
             payload_json = json.dumps(payload, separators=(",", ":"), sort_keys=True)
-            async with aiosqlite.connect(self.db_path) as db:
-                await db.execute(
-                    """
-                    INSERT INTO outbox (image_id, payload_json, status, created_at_ts)
-                    VALUES (?, ?, ?, ?)
-                    """,
-                    (image_id, payload_json, "queued", created_at_ts),
-                )
-                await db.commit()
+            db = self._require_db()
+            await db.execute(
+                """
+                INSERT INTO outbox (image_id, payload_json, status, created_at_ts)
+                VALUES (?, ?, ?, ?)
+                """,
+                (image_id, payload_json, "queued", created_at_ts),
+            )
+            await db.commit()
             return True
         except aiosqlite.IntegrityError:
             return False
 
     async def get_queued(self, current_ts: int) -> list[dict[str, Any]]:
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute(
-                """
-                SELECT * FROM outbox 
-                WHERE status = 'queued' 
-                  AND (next_retry_ts IS NULL OR next_retry_ts <= ?)
-                ORDER BY created_at_ts ASC
-                """,
-                (current_ts,)
-            ) as cursor:
-                rows = await cursor.fetchall()
-                return [dict(row) for row in rows]
+        db = self._require_db()
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """
+            SELECT * FROM outbox 
+            WHERE status = 'queued' 
+              AND (next_retry_ts IS NULL OR next_retry_ts <= ?)
+            ORDER BY created_at_ts ASC
+            """,
+            (current_ts,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
 
     async def mark_sending(self, image_id: str) -> None:
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute(
-                "UPDATE outbox SET status = 'sending' WHERE image_id = ?",
-                (image_id,),
-            )
-            await db.commit()
+        db = self._require_db()
+        await db.execute(
+            "UPDATE outbox SET status = 'sending' WHERE image_id = ?",
+            (image_id,),
+        )
+        await db.commit()
 
     async def mark_sent(self, image_id: str) -> None:
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute(
-                "UPDATE outbox SET status = 'sent' WHERE image_id = ?",
-                (image_id,),
-            )
-            await db.commit()
+        db = self._require_db()
+        await db.execute(
+            "UPDATE outbox SET status = 'sent' WHERE image_id = ?",
+            (image_id,),
+        )
+        await db.commit()
 
     async def mark_failed(
         self,
@@ -154,41 +177,50 @@ class OutboxDB:
         if attempts >= max_attempts:
             new_status = "dead"
 
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute(
-                """
-                UPDATE outbox 
-                SET status = ?, attempts = ?, next_retry_ts = ?, last_error = ? 
-                WHERE image_id = ?
-                """,
-                (new_status, attempts, next_retry_ts, error, image_id),
-            )
-            await db.commit()
+        db = self._require_db()
+        await db.execute(
+            """
+            UPDATE outbox 
+            SET status = ?, attempts = ?, next_retry_ts = ?, last_error = ? 
+            WHERE image_id = ?
+            """,
+            (new_status, attempts, next_retry_ts, error, image_id),
+        )
+        await db.commit()
+
+    async def recover_stale_sending(self) -> int:
+        db = self._require_db()
+        cursor = await db.execute(
+            "UPDATE outbox SET status = 'queued' WHERE status = 'sending'"
+        )
+        await db.commit()
+        count = int(cursor.rowcount or 0)
+        return count if count > 0 else 0
 
     async def get_status_counts(self) -> dict[str, int]:
         counts = {"queued": 0, "sending": 0, "sent": 0, "dead": 0}
-        async with aiosqlite.connect(self.db_path) as db:
-            async with db.execute(
-                "SELECT status, COUNT(*) FROM outbox GROUP BY status"
-            ) as cursor:
-                rows = await cursor.fetchall()
+        db = self._require_db()
+        async with db.execute(
+            "SELECT status, COUNT(*) FROM outbox GROUP BY status"
+        ) as cursor:
+            rows = await cursor.fetchall()
         for status, count in rows:
             if status in counts:
                 counts[str(status)] = int(count)
         return counts
 
     async def get_last_error(self) -> str | None:
-        async with aiosqlite.connect(self.db_path) as db:
-            async with db.execute(
-                """
-                SELECT last_error
-                FROM outbox
-                WHERE last_error IS NOT NULL AND last_error != ''
-                ORDER BY created_at_ts DESC
-                LIMIT 1
-                """
-            ) as cursor:
-                row = await cursor.fetchone()
+        db = self._require_db()
+        async with db.execute(
+            """
+            SELECT last_error
+            FROM outbox
+            WHERE last_error IS NOT NULL AND last_error != ''
+            ORDER BY created_at_ts DESC
+            LIMIT 1
+            """
+        ) as cursor:
+            row = await cursor.fetchone()
         if row is None:
             return None
         return str(row[0])
@@ -196,22 +228,22 @@ class OutboxDB:
     async def get_cached_ws_response(
         self, request_id: str, current_ts: int
     ) -> dict[str, Any] | None:
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute(
-                "DELETE FROM ws_request_cache WHERE expires_at_ts <= ?",
-                (current_ts,),
-            )
-            db.row_factory = aiosqlite.Row
-            async with db.execute(
-                """
-                SELECT response_json
-                FROM ws_request_cache
-                WHERE request_id = ?
-                """,
-                (request_id,),
-            ) as cursor:
-                row = await cursor.fetchone()
-            await db.commit()
+        db = self._require_db()
+        await db.execute(
+            "DELETE FROM ws_request_cache WHERE expires_at_ts <= ?",
+            (current_ts,),
+        )
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """
+            SELECT response_json
+            FROM ws_request_cache
+            WHERE request_id = ?
+            """,
+            (request_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        await db.commit()
         if row is None:
             return None
         try:
@@ -232,26 +264,26 @@ class OutboxDB:
         max_entries: int = 256,
     ) -> None:
         response_json = json.dumps(response_payload, separators=(",", ":"), sort_keys=True)
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute(
-                """
-                INSERT INTO ws_request_cache (
-                    request_id,
-                    response_json,
-                    created_at_ts,
-                    expires_at_ts
-                )
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(request_id)
-                DO UPDATE SET
-                    response_json = excluded.response_json,
-                    created_at_ts = excluded.created_at_ts,
-                    expires_at_ts = excluded.expires_at_ts
-                """,
-                (request_id, response_json, created_at_ts, expires_at_ts),
+        db = self._require_db()
+        await db.execute(
+            """
+            INSERT INTO ws_request_cache (
+                request_id,
+                response_json,
+                created_at_ts,
+                expires_at_ts
             )
-            await self._prune_ws_cache(db, max_entries=max_entries)
-            await db.commit()
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(request_id)
+            DO UPDATE SET
+                response_json = excluded.response_json,
+                created_at_ts = excluded.created_at_ts,
+                expires_at_ts = excluded.expires_at_ts
+            """,
+            (request_id, response_json, created_at_ts, expires_at_ts),
+        )
+        await self._prune_ws_cache(db, max_entries=max_entries)
+        await db.commit()
 
     async def _prune_ws_cache(
         self, db: aiosqlite.Connection, *, max_entries: int

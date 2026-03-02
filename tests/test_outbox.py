@@ -57,14 +57,43 @@ async def test_outbox_migrates_scan_id_schema_to_image_id(tmp_path: Path) -> Non
 
     outbox = OutboxDB(db_path)
     await outbox.init_db()
+    try:
+        with sqlite3.connect(db_path) as conn:
+            columns = [row[1] for row in conn.execute("PRAGMA table_info(outbox)").fetchall()]
+        assert "image_id" in columns
+        assert "scan_id" not in columns
 
-    with sqlite3.connect(db_path) as conn:
-        columns = [row[1] for row in conn.execute("PRAGMA table_info(outbox)").fetchall()]
-    assert "image_id" in columns
-    assert "scan_id" not in columns
+        queued_rows = await outbox.get_queued(current_ts=int(time.time()) + 3600)
+        assert len(queued_rows) == 1
+        assert queued_rows[0]["image_id"] == "legacy-1"
+        assert queued_rows[0]["attempts"] == 3
+        assert queued_rows[0]["last_error"] == "legacy error"
+    finally:
+        await outbox.close()
 
-    queued_rows = await outbox.get_queued(current_ts=int(time.time()) + 3600)
-    assert len(queued_rows) == 1
-    assert queued_rows[0]["image_id"] == "legacy-1"
-    assert queued_rows[0]["attempts"] == 3
-    assert queued_rows[0]["last_error"] == "legacy error"
+
+@pytest.mark.asyncio
+async def test_outbox_requeues_stale_sending_rows_on_startup(tmp_path: Path) -> None:
+    db_path = tmp_path / "outbox.db"
+
+    first_run = OutboxDB(db_path)
+    await first_run.init_db()
+    try:
+        await first_run.insert(
+            "img-1",
+            {"session_id": "s1", "image_id": "img-1", "fruits": []},
+            int(time.time()),
+        )
+        await first_run.mark_sending("img-1")
+    finally:
+        await first_run.close()
+
+    restarted = OutboxDB(db_path)
+    await restarted.init_db()
+    try:
+        queued_rows = await restarted.get_queued(current_ts=int(time.time()) + 3600)
+        assert len(queued_rows) == 1
+        assert queued_rows[0]["image_id"] == "img-1"
+        assert queued_rows[0]["status"] == "queued"
+    finally:
+        await restarted.close()

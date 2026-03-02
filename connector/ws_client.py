@@ -89,17 +89,19 @@ class WebSocketWorker:
     def stop(self) -> None:
         LOGGER.info("Stopping websocket worker loop")
         self._cancel_event.set()
-        if self._active_websocket is not None:
-            with contextlib.suppress(RuntimeError):
-                asyncio.create_task(self._active_websocket.close())
 
     def _connect(self, ws_url: str, headers: dict[str, str]) -> Any:
         connect_kwargs: dict[str, Any] = {"ping_interval": None}
         signature = inspect.signature(websockets.connect)
         if "additional_headers" in signature.parameters:
             connect_kwargs["additional_headers"] = headers
-        else:
+        elif "extra_headers" in signature.parameters:
             connect_kwargs["extra_headers"] = headers
+        else:
+            LOGGER.warning(
+                "websockets.connect supports neither additional_headers nor extra_headers; "
+                "continuing without auth headers."
+            )
         return websockets.connect(ws_url, **connect_kwargs)
 
     async def _run_session(self) -> None:
@@ -122,9 +124,11 @@ class WebSocketWorker:
             )
             heartbeat_task = asyncio.create_task(self._heartbeat_loop(websocket))
             try:
-                async for raw_message in websocket:
-                    if self._cancel_event.is_set():
-                        break
+                while not self._cancel_event.is_set():
+                    try:
+                        raw_message = await asyncio.wait_for(websocket.recv(), timeout=1.0)
+                    except asyncio.TimeoutError:
+                        continue
                     await self._handle_incoming_message(websocket, raw_message)
             finally:
                 heartbeat_task.cancel()
