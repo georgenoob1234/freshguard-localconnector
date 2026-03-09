@@ -11,10 +11,13 @@ from typing import Any, Callable, Mapping
 import httpx
 
 from connector.config import ConnectorConfig
+from connector.logging import get_logger
 from connector.outbox import OutboxDB
 
+LOGGER = get_logger(__name__)
+
 ALLOWED_REQUEST_TYPES = frozenset(
-    {"ping", "device.info", "connector.stats", "camera.capture"}
+    {"ping", "device.info", "connector.stats", "camera.capture", "tare"}
 )
 REQUEST_CACHE_TTL_SECONDS = 300
 REQUEST_CACHE_MAX_ENTRIES = 256
@@ -30,6 +33,15 @@ class RequestContext:
 
 
 class CommandExecutionError(RuntimeError):
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+class CommandRejectedError(RuntimeError):
+    """Raised when WeightServer rejects a valid request for business/device-state reasons."""
+
     def __init__(self, code: str, message: str) -> None:
         super().__init__(message)
         self.code = code
@@ -111,6 +123,20 @@ class WSCommandHandler:
         elif not request_id:
             accepted = False
             reason = "missing_request_id"
+        elif request_type == "tare":
+            mode = _string_or_empty(params_dict.get("mode")) if params_dict else ""
+            if mode not in ("set", "reset"):
+                accepted = False
+                reason = "invalid_tare_params"
+            elif accepted:
+                LOGGER.info(
+                    "Tare request received",
+                    extra={
+                        "request_id": request_id,
+                        "mode": mode,
+                        "device_id": self.identity.get("device_id", ""),
+                    },
+                )
 
         ack_payload: dict[str, Any] = {
             "request_id": request_id,
@@ -145,7 +171,7 @@ class WSCommandHandler:
             return cached
 
         if not context.accepted:
-            response = self._rejected_response(context)
+            response = self._rejected_response(context, reason=context.reason)
             await self._cache_response(context.request_id, response, current_ts=current_ts)
             return response
 
@@ -190,6 +216,7 @@ class WSCommandHandler:
                 "request_type": context.request_type,
                 "status": "ok",
                 "data": data,
+                "error": None,
             }
         except asyncio.TimeoutError:
             return self._error_response(
@@ -201,6 +228,10 @@ class WSCommandHandler:
             )
         except CommandExecutionError as exc:
             return self._error_response(context, code=exc.code, message=exc.message)
+        except CommandRejectedError as exc:
+            return self._rejected_response(
+                context, reason=None, code=exc.code, message=exc.message
+            )
         except Exception as exc:  # pragma: no cover - defensive fallback
             return self._error_response(
                 context,
@@ -223,6 +254,8 @@ class WSCommandHandler:
             return await self._connector_stats()
         if request_type == "camera.capture":
             return await self._camera_capture(params)
+        if request_type == "tare":
+            return await self._tare(params)
         raise CommandExecutionError(
             "rejected_not_allowed",
             "Request type is not allowlisted.",
@@ -357,15 +390,112 @@ class WSCommandHandler:
                 "content_type": content_type,
             }
 
-    def _rejected_response(self, context: RequestContext) -> dict[str, Any]:
+    async def _tare(self, params: dict[str, Any]) -> dict[str, Any]:
+        mode = _string_or_empty(params.get("mode"))
+        if mode not in ("set", "reset"):
+            raise CommandExecutionError(
+                "invalid_tare_params",
+                "Invalid or missing tare mode. Must be 'set' or 'reset'.",
+            )
+
+        device_id = self.identity.get("device_id", "")
+        LOGGER.info(
+            "Tare execution started",
+            extra={"mode": mode, "device_id": device_id},
+        )
+
+        client_kwargs: dict[str, Any] = {}
+        if self.http_transport is not None:
+            client_kwargs["transport"] = self.http_transport
+        client_kwargs["timeout"] = max(
+            1.0,
+            float(self.config.command_timeout_seconds) / 2.0,
+        )
+
+        path = "/tare" if mode == "set" else "/tare/reset"
+        url = f"{self.config.weight_server_url}{path}"
+
+        try:
+            async with httpx.AsyncClient(**client_kwargs) as client:
+                response = await client.post(url)
+                if response.status_code >= 500:
+                    LOGGER.warning(
+                        "Tare execution failed",
+                        extra={
+                            "mode": mode,
+                            "device_id": device_id,
+                            "code": "weight_server_error",
+                            "http_status": response.status_code,
+                        },
+                    )
+                    raise CommandExecutionError(
+                        "weight_server_error",
+                        f"WeightServer returned HTTP {response.status_code}.",
+                    )
+                if response.status_code >= 400:
+                    data = _response_json_dict(response)
+                    code = "tare_rejected"
+                    message = "WeightServer rejected the tare request."
+                    if isinstance(data, dict):
+                        code = _string_or_empty(data.get("code")) or code
+                        msg_val = data.get("message") or data.get("error")
+                        if isinstance(msg_val, str) and msg_val.strip():
+                            message = msg_val.strip()
+                    LOGGER.warning(
+                        "Tare rejected",
+                        extra={
+                            "mode": mode,
+                            "device_id": device_id,
+                            "code": code,
+                            "http_status": response.status_code,
+                        },
+                    )
+                    raise CommandRejectedError(code=code, message=message)
+                LOGGER.info(
+                    "Tare execution finished",
+                    extra={"mode": mode, "device_id": device_id},
+                )
+                return {"accepted": True, "mode": mode}
+        except (httpx.ConnectError, httpx.ReadTimeout, httpx.ConnectTimeout) as exc:
+            LOGGER.warning(
+                "Tare execution failed",
+                extra={
+                    "mode": mode,
+                    "device_id": device_id,
+                    "code": "weight_server_unavailable",
+                    "error": str(exc),
+                },
+            )
+            raise CommandExecutionError(
+                "weight_server_unavailable",
+                f"WeightServer unreachable or timed out: {exc!s}",
+            ) from exc
+
+    def _rejected_response(
+        self,
+        context: RequestContext,
+        *,
+        reason: str | None = None,
+        code: str | None = None,
+        message: str | None = None,
+    ) -> dict[str, Any]:
+        if code is not None and message is not None:
+            err = {"code": code, "message": message}
+        elif reason == "invalid_tare_params":
+            err = {
+                "code": "invalid_tare_params",
+                "message": "Invalid or missing tare mode. Must be 'set' or 'reset'.",
+            }
+        else:
+            err = {
+                "code": "rejected_not_allowed",
+                "message": "Request type is not allowlisted.",
+            }
         return {
             "request_id": context.request_id,
             "request_type": context.request_type,
             "status": "rejected",
-            "error": {
-                "code": "rejected_not_allowed",
-                "message": "Request type is not allowlisted.",
-            },
+            "error": err,
         }
 
     def _error_response(

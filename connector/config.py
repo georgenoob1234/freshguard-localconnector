@@ -40,6 +40,7 @@ class ConnectorConfig(BaseSettings):
     ws_reconnect_max_seconds: int = Field(default=30, validation_alias="WS_RECONNECT_MAX_SECONDS")
     command_timeout_seconds: int = Field(default=20, validation_alias="COMMAND_TIMEOUT_SECONDS")
     camera_service_url: str = Field(default="http://localhost:8200", validation_alias="CAMERA_SERVICE_URL")
+    weight_server_url: str = Field(default="http://localhost:8100", validation_alias="WEIGHT_SERVER_URL")
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -73,5 +74,6 @@ def resolve_config(
     if not config.oms_blob_upload_path.startswith("/"):
         config.oms_blob_upload_path = f"/{config.oms_blob_upload_path}"
     config.camera_service_url = config.camera_service_url.rstrip("/")
-        
+    config.weight_server_url = config.weight_server_url.rstrip("/")
+
     return config
