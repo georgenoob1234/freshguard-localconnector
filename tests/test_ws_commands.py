@@ -24,6 +24,7 @@ async def _build_handler(
     config = ConnectorConfig(
         outbox_db_path=db_path,
         camera_service_url="http://camera.local",
+        weight_server_url="http://weight.local",
         online_url="https://online.test",
     )
     identity = {
@@ -214,5 +215,177 @@ async def test_camera_capture_uploads_blob_and_returns_blob_id(tmp_path: Path) -
         assert data["content_type"] == "image/jpeg"
         assert data["size_bytes"] == len(image_bytes)
         assert all(not isinstance(value, (bytes, bytearray)) for value in data.values())
+    finally:
+        await outbox_db.close()
+
+
+@pytest.mark.asyncio
+async def test_tare_set_success(tmp_path: Path) -> None:
+    def handle_request(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and str(request.url) == "http://weight.local/tare":
+            return httpx.Response(200)
+        raise AssertionError(f"Unexpected request {request.method} {request.url}")
+
+    transport = httpx.MockTransport(handle_request)
+    handler, outbox_db = await _build_handler(tmp_path, transport=transport)
+    try:
+        ack_payload, response_payload = await handler.handle_request_payload(
+            {
+                "request_id": "req-tare-set",
+                "request_type": "tare",
+                "params": {"mode": "set"},
+            }
+        )
+
+        assert ack_payload["accepted"] is True
+        assert response_payload["status"] == "ok"
+        assert response_payload["data"]["accepted"] is True
+        assert response_payload["data"]["mode"] == "set"
+        assert response_payload["error"] is None
+    finally:
+        await outbox_db.close()
+
+
+@pytest.mark.asyncio
+async def test_tare_reset_success(tmp_path: Path) -> None:
+    def handle_request(request: httpx.Request) -> httpx.Response:
+        if (
+            request.method == "POST"
+            and str(request.url) == "http://weight.local/tare/reset"
+        ):
+            return httpx.Response(200)
+        raise AssertionError(f"Unexpected request {request.method} {request.url}")
+
+    transport = httpx.MockTransport(handle_request)
+    handler, outbox_db = await _build_handler(tmp_path, transport=transport)
+    try:
+        ack_payload, response_payload = await handler.handle_request_payload(
+            {
+                "request_id": "req-tare-reset",
+                "request_type": "tare",
+                "params": {"mode": "reset"},
+            }
+        )
+
+        assert ack_payload["accepted"] is True
+        assert response_payload["status"] == "ok"
+        assert response_payload["data"]["accepted"] is True
+        assert response_payload["data"]["mode"] == "reset"
+    finally:
+        await outbox_db.close()
+
+
+@pytest.mark.asyncio
+async def test_tare_malformed_payload_rejected(tmp_path: Path) -> None:
+    handler, outbox_db = await _build_handler(tmp_path)
+    try:
+        # Missing params
+        ack1, resp1 = await handler.handle_request_payload(
+            {
+                "request_id": "req-1",
+                "request_type": "tare",
+                "params": {},
+            }
+        )
+        assert ack1["accepted"] is False
+        assert ack1["reason"] == "invalid_tare_params"
+        assert resp1["status"] == "rejected"
+        assert resp1["error"]["code"] == "invalid_tare_params"
+
+        # Invalid mode
+        ack2, resp2 = await handler.handle_request_payload(
+            {
+                "request_id": "req-2",
+                "request_type": "tare",
+                "params": {"mode": "invalid"},
+            }
+        )
+        assert ack2["accepted"] is False
+        assert ack2["reason"] == "invalid_tare_params"
+        assert resp2["status"] == "rejected"
+    finally:
+        await outbox_db.close()
+
+
+@pytest.mark.asyncio
+async def test_tare_weight_server_rejection(tmp_path: Path) -> None:
+    def handle_request(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and str(request.url) == "http://weight.local/tare":
+            return httpx.Response(
+                409,
+                json={
+                    "code": "scale_not_stable",
+                    "message": "Scale reading is not stable.",
+                },
+            )
+        raise AssertionError(f"Unexpected request {request.method} {request.url}")
+
+    transport = httpx.MockTransport(handle_request)
+    handler, outbox_db = await _build_handler(tmp_path, transport=transport)
+    try:
+        _, response_payload = await handler.handle_request_payload(
+            {
+                "request_id": "req-tare-reject",
+                "request_type": "tare",
+                "params": {"mode": "set"},
+            }
+        )
+
+        assert response_payload["status"] == "rejected"
+        assert response_payload["error"]["code"] == "scale_not_stable"
+        assert "stable" in response_payload["error"]["message"].lower()
+    finally:
+        await outbox_db.close()
+
+
+@pytest.mark.asyncio
+async def test_tare_weight_server_unavailable(tmp_path: Path) -> None:
+    def handle_request(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and "weight.local" in str(request.url):
+            return httpx.Response(503)
+        raise AssertionError(f"Unexpected request {request.method} {request.url}")
+
+    transport = httpx.MockTransport(handle_request)
+    handler, outbox_db = await _build_handler(tmp_path, transport=transport)
+    try:
+        _, response_payload = await handler.handle_request_payload(
+            {
+                "request_id": "req-tare-fail",
+                "request_type": "tare",
+                "params": {"mode": "set"},
+            }
+        )
+
+        assert response_payload["status"] == "error"
+        assert response_payload["error"]["code"] in (
+            "weight_server_error",
+            "weight_server_unavailable",
+        )
+    finally:
+        await outbox_db.close()
+
+
+@pytest.mark.asyncio
+async def test_tare_request_id_propagation(tmp_path: Path) -> None:
+    expected_request_id = "req-uuid-12345"
+
+    def handle_request(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and str(request.url) == "http://weight.local/tare":
+            return httpx.Response(200)
+        raise AssertionError(f"Unexpected request {request.method} {request.url}")
+
+    transport = httpx.MockTransport(handle_request)
+    handler, outbox_db = await _build_handler(tmp_path, transport=transport)
+    try:
+        _, response_payload = await handler.handle_request_payload(
+            {
+                "request_id": expected_request_id,
+                "request_type": "tare",
+                "params": {"mode": "set"},
+            }
+        )
+
+        assert response_payload["request_id"] == expected_request_id
+        assert response_payload["request_type"] == "tare"
     finally:
         await outbox_db.close()
