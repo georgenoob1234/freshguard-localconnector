@@ -1,0 +1,30 @@
+version: "3.9"
+
+services:
+  localconnector:
+    build:
+      context: .
+    image: localconnector:latest
+    ports:
+      - "8600:8600"
+    environment:
+      SERVICE_HOST: 0.0.0.0
+      SERVICE_PORT: 8600
+      ONLINE_URL: ${ONLINE_URL}
+      ENROLL_TOKEN: ${ENROLL_TOKEN}
+      CONNECTOR_IDENTITY_PATH: /data/connector_identity.json
+      OUTBOX_DB_PATH: /data/localconnector.db
+    volumes:
+      - localconnector-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys;url='http://127.0.0.1:'+str(__import__('os').getenv('SERVICE_PORT','8600'))+'/health';\n\
+try: urllib.request.urlopen(url,timeout=3)\n\
+except Exception: sys.exit(1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  localconnector-data:
