@@ -7,6 +7,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping
+from urllib.parse import quote
 
 import httpx
 
@@ -17,7 +18,14 @@ from connector.outbox import OutboxDB
 LOGGER = get_logger(__name__)
 
 ALLOWED_REQUEST_TYPES = frozenset(
-    {"ping", "device.info", "connector.stats", "camera.capture", "tare"}
+    {
+        "ping",
+        "device.info",
+        "connector.stats",
+        "camera.capture",
+        "request_image",
+        "tare",
+    }
 )
 REQUEST_CACHE_TTL_SECONDS = 300
 REQUEST_CACHE_MAX_ENTRIES = 256
@@ -60,6 +68,16 @@ def _build_image_fetch_url(camera_service_url: str, image_url_or_path: str) -> s
     if image_url_or_path.startswith("/"):
         return f"{camera_service_url}{image_url_or_path}"
     return f"{camera_service_url}/{image_url_or_path}"
+
+
+def _build_request_image_fetch_urls(
+    camera_service_url: str, image_id: str
+) -> tuple[str, ...]:
+    normalized_image_id = quote(image_id, safe="")
+    return (
+        f"{camera_service_url}/api/images/{normalized_image_id}",
+        f"{camera_service_url}/images/{normalized_image_id}",
+    )
 
 
 def _response_json_dict(response: httpx.Response) -> dict[str, Any] | None:
@@ -137,6 +155,20 @@ class WSCommandHandler:
                         "device_id": self.identity.get("device_id", ""),
                     },
                 )
+        elif request_type == "request_image":
+            image_id = _string_or_empty(params_dict.get("image_id")) if params_dict else ""
+            if not image_id:
+                accepted = False
+                reason = "invalid_request_image_params"
+            elif accepted:
+                LOGGER.info(
+                    "request_image request received",
+                    extra={
+                        "request_id": request_id,
+                        "image_id": image_id,
+                        "device_id": self.identity.get("device_id", ""),
+                    },
+                )
 
         ack_payload: dict[str, Any] = {
             "request_id": request_id,
@@ -192,6 +224,21 @@ class WSCommandHandler:
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         ack_payload, context = self.build_ack_payload(payload)
         response_payload = await self.build_response_payload(context)
+        error_payload = response_payload.get("error")
+        error_code = ""
+        if isinstance(error_payload, dict):
+            error_code = _string_or_empty(error_payload.get("code"))
+        LOGGER.info(
+            "WS request processed",
+            extra={
+                "request_id": context.request_id,
+                "request_type": context.request_type,
+                "accepted": context.accepted,
+                "response_status": _string_or_empty(response_payload.get("status")),
+                "error_code": error_code,
+                "device_id": self.identity.get("device_id", ""),
+            },
+        )
         return ack_payload, response_payload
 
     async def _cache_response(
@@ -254,12 +301,110 @@ class WSCommandHandler:
             return await self._connector_stats()
         if request_type == "camera.capture":
             return await self._camera_capture(params)
+        if request_type == "request_image":
+            return await self._request_image(params)
         if request_type == "tare":
             return await self._tare(params)
         raise CommandExecutionError(
             "rejected_not_allowed",
             "Request type is not allowlisted.",
         )
+
+    def _http_client_kwargs(self) -> dict[str, Any]:
+        client_kwargs: dict[str, Any] = {}
+        if self.http_transport is not None:
+            client_kwargs["transport"] = self.http_transport
+        client_kwargs["timeout"] = max(
+            1.0,
+            float(self.config.command_timeout_seconds) / 2.0,
+        )
+        return client_kwargs
+
+    async def _upload_image_to_oms(
+        self,
+        *,
+        client: httpx.AsyncClient,
+        image_id: str,
+        image_url_or_path: str,
+        image_bytes: bytes,
+        content_type_header: str | None,
+        request_type: str,
+    ) -> dict[str, Any]:
+        content_type = _resolve_content_type(content_type_header, image_url_or_path)
+        sha256 = hashlib.sha256(image_bytes).hexdigest()
+        size_bytes = len(image_bytes)
+        upload_url = f"{self.identity['online_url']}{self.config.oms_blob_upload_path}"
+        upload_filename = _resolve_upload_filename(
+            image_id, image_url_or_path, content_type
+        )
+        LOGGER.info(
+            "OMS blob upload started",
+            extra={
+                "request_type": request_type,
+                "image_id": image_id,
+                "content_type": content_type,
+                "size_bytes": size_bytes,
+                "device_id": self.identity.get("device_id", ""),
+            },
+        )
+        upload_response = await client.post(
+            upload_url,
+            headers={"Authorization": f"Bearer {self.identity['device_token']}"},
+            data={
+                "image_id": image_id,
+                "content_type": content_type,
+                "sha256": sha256,
+            },
+            files={
+                "file": (upload_filename, image_bytes, content_type),
+            },
+        )
+        if upload_response.status_code >= 400:
+            LOGGER.warning(
+                "OMS blob upload failed",
+                extra={
+                    "request_type": request_type,
+                    "image_id": image_id,
+                    "http_status": upload_response.status_code,
+                    "device_id": self.identity.get("device_id", ""),
+                },
+            )
+            raise CommandExecutionError(
+                "blob_upload_failed",
+                f"OMS blob upload failed with HTTP {upload_response.status_code}.",
+            )
+        upload_data = _response_json_dict(upload_response)
+        blob_id = _string_or_empty(upload_data.get("blob_id") if upload_data else None)
+        if not blob_id:
+            LOGGER.warning(
+                "OMS blob upload response missing blob_id",
+                extra={
+                    "request_type": request_type,
+                    "image_id": image_id,
+                    "device_id": self.identity.get("device_id", ""),
+                },
+            )
+            raise CommandExecutionError(
+                "blob_upload_failed",
+                "OMS blob upload response missing blob_id.",
+            )
+
+        LOGGER.info(
+            "OMS blob upload succeeded",
+            extra={
+                "request_type": request_type,
+                "image_id": image_id,
+                "blob_id": blob_id,
+                "device_id": self.identity.get("device_id", ""),
+            },
+        )
+        return {
+            "image_id": image_id,
+            "blob_id": blob_id,
+            "sha256": sha256,
+            "size_bytes": size_bytes,
+            "content_type": content_type,
+        }
 
     async def _connector_stats(self) -> dict[str, Any]:
         counts = await self.outbox_db.get_status_counts()
@@ -292,15 +437,7 @@ class WSCommandHandler:
             if key in params and params[key] is not None
         }
 
-        client_kwargs: dict[str, Any] = {}
-        if self.http_transport is not None:
-            client_kwargs["transport"] = self.http_transport
-        client_kwargs["timeout"] = max(
-            1.0,
-            float(self.config.command_timeout_seconds) / 2.0,
-        )
-
-        async with httpx.AsyncClient(**client_kwargs) as client:
+        async with httpx.AsyncClient(**self._http_client_kwargs()) as client:
             capture_kwargs: dict[str, Any] = {}
             if capture_payload:
                 capture_kwargs["json"] = capture_payload
@@ -346,49 +483,115 @@ class WSCommandHandler:
                     "Camera image fetch returned empty content.",
                 )
 
-            content_type = _resolve_content_type(
-                image_response.headers.get("content-type"),
-                image_url_or_path,
+            return await self._upload_image_to_oms(
+                client=client,
+                image_id=image_id,
+                image_url_or_path=image_url_or_path,
+                image_bytes=image_bytes,
+                content_type_header=image_response.headers.get("content-type"),
+                request_type="camera.capture",
             )
-            sha256 = hashlib.sha256(image_bytes).hexdigest()
-            size_bytes = len(image_bytes)
 
-            upload_url = f"{self.identity['online_url']}{self.config.oms_blob_upload_path}"
-            upload_filename = _resolve_upload_filename(
-                image_id, image_url_or_path, content_type
+    async def _request_image(self, params: dict[str, Any]) -> dict[str, Any]:
+        image_id = _string_or_empty(params.get("image_id"))
+        if not image_id:
+            raise CommandExecutionError(
+                "invalid_request_image_params",
+                "Invalid or missing image_id.",
             )
-            upload_response = await client.post(
-                upload_url,
-                headers={"Authorization": f"Bearer {self.identity['device_token']}"},
-                data={
-                    "image_id": image_id,
-                    "content_type": content_type,
-                    "sha256": sha256,
-                },
-                files={
-                    "file": (upload_filename, image_bytes, content_type),
-                },
-            )
-            if upload_response.status_code >= 400:
-                raise CommandExecutionError(
-                    "blob_upload_failed",
-                    f"OMS blob upload failed with HTTP {upload_response.status_code}.",
-                )
-            upload_data = _response_json_dict(upload_response)
-            blob_id = _string_or_empty(upload_data.get("blob_id") if upload_data else None)
-            if not blob_id:
-                raise CommandExecutionError(
-                    "blob_upload_failed",
-                    "OMS blob upload response missing blob_id.",
-                )
 
-            return {
+        fetch_urls = _build_request_image_fetch_urls(
+            self.config.camera_service_url, image_id
+        )
+        LOGGER.info(
+            "request_image fetch started",
+            extra={
+                "request_type": "request_image",
                 "image_id": image_id,
-                "blob_id": blob_id,
-                "sha256": sha256,
-                "size_bytes": size_bytes,
-                "content_type": content_type,
-            }
+                "device_id": self.identity.get("device_id", ""),
+            },
+        )
+        last_status_code: int | None = None
+
+        try:
+            async with httpx.AsyncClient(**self._http_client_kwargs()) as client:
+                for fetch_url in fetch_urls:
+                    image_response = await client.get(fetch_url)
+                    last_status_code = image_response.status_code
+                    if image_response.status_code == 404:
+                        continue
+                    if image_response.status_code >= 400:
+                        LOGGER.warning(
+                            "request_image fetch failed",
+                            extra={
+                                "request_type": "request_image",
+                                "image_id": image_id,
+                                "http_status": image_response.status_code,
+                                "device_id": self.identity.get("device_id", ""),
+                            },
+                        )
+                        raise CommandExecutionError(
+                            "camera_fetch_failed",
+                            (
+                                "Failed to fetch camera image with "
+                                f"HTTP {image_response.status_code}."
+                            ),
+                        )
+
+                    image_bytes = image_response.content
+                    if not image_bytes:
+                        raise CommandExecutionError(
+                            "camera_fetch_failed",
+                            "Camera image fetch returned empty content.",
+                        )
+                    LOGGER.info(
+                        "request_image fetch succeeded",
+                        extra={
+                            "request_type": "request_image",
+                            "image_id": image_id,
+                            "device_id": self.identity.get("device_id", ""),
+                        },
+                    )
+                    return await self._upload_image_to_oms(
+                        client=client,
+                        image_id=image_id,
+                        image_url_or_path=fetch_url,
+                        image_bytes=image_bytes,
+                        content_type_header=image_response.headers.get("content-type"),
+                        request_type="request_image",
+                    )
+        except (httpx.ConnectError, httpx.ReadTimeout, httpx.ConnectTimeout) as exc:
+            LOGGER.warning(
+                "request_image camera service unavailable",
+                extra={
+                    "request_type": "request_image",
+                    "image_id": image_id,
+                    "device_id": self.identity.get("device_id", ""),
+                    "error": str(exc),
+                },
+            )
+            raise CommandExecutionError(
+                "camera_unavailable",
+                f"Camera service unreachable or timed out: {exc!s}",
+            ) from exc
+
+        if last_status_code == 404:
+            LOGGER.warning(
+                "request_image not found",
+                extra={
+                    "request_type": "request_image",
+                    "image_id": image_id,
+                    "device_id": self.identity.get("device_id", ""),
+                },
+            )
+            raise CommandExecutionError(
+                "camera_fetch_failed",
+                "Camera image was not found for provided image_id.",
+            )
+        raise CommandExecutionError(
+            "camera_fetch_failed",
+            "Failed to fetch camera image.",
+        )
 
     async def _tare(self, params: dict[str, Any]) -> dict[str, Any]:
         mode = _string_or_empty(params.get("mode"))
@@ -485,6 +688,11 @@ class WSCommandHandler:
             err = {
                 "code": "invalid_tare_params",
                 "message": "Invalid or missing tare mode. Must be 'set' or 'reset'.",
+            }
+        elif reason == "invalid_request_image_params":
+            err = {
+                "code": "invalid_request_image_params",
+                "message": "Invalid or missing image_id.",
             }
         else:
             err = {
