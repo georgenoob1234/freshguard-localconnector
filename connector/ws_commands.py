@@ -76,7 +76,7 @@ def _build_request_image_fetch_urls(
     normalized_image_id = quote(image_id, safe="")
     return (
         f"{camera_service_url}/api/images/{normalized_image_id}.jpg",
-        f"{camera_service_url}/images/{normalized_image_id}.jpg",
+        f"{camera_service_url}/api/images/{normalized_image_id}.png",
     )
 
 
