@@ -11,6 +11,8 @@ RUN addgroup --system appgroup && adduser --system --ingroup appgroup appuser
 
 WORKDIR /app
 
+RUN mkdir -p /data && chown -R appuser:appgroup /data
+
 COPY requirements.txt ./
 RUN python -m pip install --upgrade pip \
     && pip install --no-cache-dir -r requirements.txt
@@ -20,12 +22,7 @@ COPY connector ./connector
 EXPOSE 8600
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD python -c "import urllib.request,sys;\n\
-url='http://127.0.0.1:'+str(__import__('os').getenv('SERVICE_PORT','8600'))+'/health';\n\
-try:\n\
-    urllib.request.urlopen(url,timeout=3)\n\
-except Exception:\n\
-    sys.exit(1)" || exit 1
+    CMD python -c "import os,urllib.request; p=os.environ.get('SERVICE_PORT','8600'); urllib.request.urlopen('http://127.0.0.1:%s/health' % p, timeout=3)"
 
 USER appuser
 
